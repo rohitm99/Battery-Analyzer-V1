@@ -188,13 +188,30 @@ def configure_thermal_limits(ser):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_step(idx):
+    """Build one user-facing step. Returns a LIST of protocol steps: usually one,
+    but a CC charge with a CV hold expands to two (CC_CHARGE + CV_CHARGE). The CV
+    hold is synthesized here as its own visible step so step indices, the protocol
+    summary, and loop ranges all stay consistent."""
     print(f"\n  --- Step {idx} ---")
-    print("    [1] CC charge   [2] CV charge (taper)   [3] CC discharge   [4] Rest   [5] EIS sweep")
+    print("    [1] CC/CV charge   [2] CC discharge   [3] Rest   [4] EIS sweep")
     while True:
         choice = input("    Step type: ").strip()
-        if choice in ("1", "2", "3", "4", "5"):
+        if choice in ("1", "2", "3", "4"):
             break
-        print("      x  Enter 1-5.")
+        print("      x  Enter 1-4.")
+
+    if choice == "4":
+        # EIS sweep. Runs a blocking RCAL + battery impedance sweep in place; the
+        # cycler power paths are off for the duration (battery thermal guard stays
+        # live in firmware). No current / duration / sample-interval applies, so we
+        # return early before those prompts.
+        eis = {"sample_ms": 0, "duration_min": 0.0, "type": "EIS"}
+        eis["eis_points"]   = prompt_int("Sweep points",          EIS_DEFAULT_POINTS,   lo=1,    hi=EIS_MAX_POINTS)
+        eis["eis_start_hz"] = prompt_float("Start frequency (Hz)", EIS_DEFAULT_START_HZ, lo=0.01)
+        eis["eis_stop_hz"]  = prompt_float("Stop frequency (Hz)",  EIS_DEFAULT_STOP_HZ,  lo=0.02)
+        print("    Note: each EIS step adds ~30s of settle time plus the per-point"
+              " measurement; the run plot pauses (no telemetry) while it sweeps.")
+        return [eis]
 
     step = {"sample_ms": 0, "duration_min": 0.0}
 
@@ -204,41 +221,40 @@ def build_step(idx):
         step["voltage_limit"]  = prompt_float("Vmax cutoff (V)", 3.60, lo=2.0, hi=4.3)
         step["duration_min"]   = prompt_float("Time cap in minutes (0 = none, stop on Vmax only)", 0.0, lo=0.0)
     elif choice == "2":
-        step["type"]           = "CV_CHARGE"
-        # This is the software PI loop's current CEILING (cvIMax in firmware),
-        # not a taper target — it must be > 0 or beginChargeCV() clamps the
-        # bumpless-transfer seed to 0 A and the CC->CV handoff collapses the
-        # charge current instantly instead of tapering. Default to matching a
-        # typical prior CC step so the common case "just works".
-        step["c_rate"]         = prompt_float("Current ceiling C-rate (CV loop cap, e.g. same as prior CC step)", 0.5, lo=0.01, hi=5.0)
-        step["voltage_limit"]  = prompt_float("Hold voltage Vmax (V)", 3.60, lo=2.0, hi=4.3)
-        step["cutoff_c_rate"]  = prompt_float("Taper cutoff C-rate (e.g. 0.0333 = C/30)", 0.0333, lo=0.001, hi=1.0)
-        step["duration_min"]   = prompt_float("Time cap in minutes (0 = none, stop on taper only)", 0.0, lo=0.0)
-    elif choice == "3":
         step["type"]           = "CC_DISCHARGE"
         step["c_rate"]         = prompt_float("Discharge C-rate (e.g. 1.0 = 1C)", 1.0, lo=0.01, hi=5.0)
         step["voltage_limit"]  = prompt_float("Vmin cutoff (V)", 2.50, lo=1.5, hi=3.8)
         step["duration_min"]   = prompt_float("Time cap in minutes (0 = none, stop on Vmin only)", 0.0, lo=0.0)
-    elif choice == "4":
+    else:  # choice == "3"
         step["type"]           = "REST"
         step["duration_min"]   = prompt_float("Rest duration in minutes", 60.0, lo=0.001)
-    else:
-        # EIS sweep. Runs a blocking RCAL + battery impedance sweep in place; the
-        # cycler power paths are off for the duration (battery thermal guard stays
-        # live in firmware). No current / duration / sample-interval applies, so we
-        # return early before those prompts.
-        step["type"]         = "EIS"
-        step["eis_points"]   = prompt_int("Sweep points",          EIS_DEFAULT_POINTS,   lo=1,    hi=EIS_MAX_POINTS)
-        step["eis_start_hz"] = prompt_float("Start frequency (Hz)", EIS_DEFAULT_START_HZ, lo=0.01)
-        step["eis_stop_hz"]  = prompt_float("Stop frequency (Hz)",  EIS_DEFAULT_STOP_HZ,  lo=0.02)
-        print("    Note: each EIS step adds ~30s of settle time plus the per-point"
-              " measurement; the run plot pauses (no telemetry) while it sweeps.")
-        return step
 
     if prompt_yesno("Use a faster sample interval for this step? (e.g. for short pulses)", default_yes=False):
         step["sample_ms"] = prompt_int("Sample interval (ms)", 50, lo=10, hi=5000)
 
-    return step
+    steps = [step]
+
+    # Optional CV hold after a CC charge. We DON'T re-ask for the hold voltage or
+    # a handoff current: the CV step inherits the CC step's voltage_limit (hold at
+    # the same Vmax the CC ramped to) and its c_rate (which upload_protocol turns
+    # into current_A == the PI ceiling, cvIMax). The CC->CV bumpless handoff seeds
+    # the integrator from the LIVE charge current in firmware (beginChargeCV), so
+    # the handoff current matches the CC value by physics, not by a passed param.
+    # Populating c_rate here is what keeps the ceiling non-zero and avoids the
+    # firmware's "CV_CHARGE step has 0 A ceiling -> CV loop NOT engaged" path.
+    if step["type"] == "CC_CHARGE" and prompt_yesno("Add a CV hold after this CC charge?", default_yes=True):
+        cutoff = prompt_float("CV taper cutoff C-rate (e.g. 0.0333 = C/30)", 0.0333, lo=0.001, hi=1.0)
+        steps.append({
+            "type":          "CV_CHARGE",
+            "c_rate":        step["c_rate"],         # -> current_A == CC ceiling (cvIMax)
+            "voltage_limit": step["voltage_limit"],  # hold at the CC Vmax
+            "cutoff_c_rate": cutoff,
+            "duration_min":  0.0,
+            "sample_ms":     0,                      # CV taper is slow; use default log rate
+            "auto_cv":       True,                   # marks this as a UI-synthesized step
+        })
+
+    return steps
 
 
 def describe_step(i, step):
@@ -254,10 +270,11 @@ def describe_step(i, step):
     if t in ("CC_CHARGE", "CV_CHARGE"):
         parts.append(f"Vmax={step['voltage_limit']}V")
     if t == "CV_CHARGE":
-        parts.append(f"ceiling={step.get('c_rate', 0.0)}C")
         parts.append(f"cutoff={step['cutoff_c_rate']}C")
     if t == "CC_DISCHARGE":
         parts.append(f"Vmin={step['voltage_limit']}V")
+    if step.get("auto_cv"):
+        parts.append("(auto CV hold)")
     if step.get("duration_min", 0) > 0:
         parts.append(f"{step['duration_min']}min cap")
     if step.get("sample_ms", 0) > 0:
@@ -274,10 +291,8 @@ def build_protocol():
     capacity_mah = prompt_float("  Cell rated capacity (mAh)", 3000.0, lo=1.0)
 
     steps = []
-    idx = 0
     while True:
-        steps.append(build_step(idx))
-        idx += 1
+        steps.extend(build_step(len(steps)))
         print("\n  Current protocol:")
         for i, s in enumerate(steps):
             print("    " + describe_step(i, s))
