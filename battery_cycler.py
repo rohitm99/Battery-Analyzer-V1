@@ -73,6 +73,57 @@ STATE_COLORS = {
 ROLLING_WINDOW_S = 600   # 10-minute rolling window for the live plot
 PROTOCOL_GLOB    = "protocol_*.json"
 
+# ── Board safety envelope ───────────────────────────────────────────────────
+# The firmware is the source of truth for these hard limits and advertises them
+# at boot (and on '?') as a line:  LIMITS,<Ichg_max>,<Idis_max>,<Vmax>,<Vmin>.
+# We read them at connect and enforce the SAME bounds at input time so a bad
+# value is caught before upload. These fallbacks are used only if an older
+# firmware doesn't advertise; keep them in step with the firmware constants.
+DEFAULT_LIMITS = {
+    "i_charge_max":    1.40,   # A
+    "i_discharge_max": 2.00,   # A
+    "v_max":           3.68,   # V
+    "v_min":           2.10,   # V
+}
+
+def parse_limits_banner(line, limits):
+    """Update `limits` in place from a firmware 'LIMITS,...' line.
+    Returns True if the line was a well-formed LIMITS banner."""
+    if not line.startswith("LIMITS,"):
+        return False
+    try:
+        p = line.split(",")
+        limits["i_charge_max"]    = float(p[1])
+        limits["i_discharge_max"] = float(p[2])
+        limits["v_max"]           = float(p[3])
+        limits["v_min"]           = float(p[4])
+        return True
+    except (IndexError, ValueError):
+        return False
+
+
+def fetch_limits(ser, timeout=2.0):
+    """Ask the board for its safety envelope via '?' and parse the LIMITS banner.
+    The host opens the port with DTR/RTS low (no reset), so the boot banner has
+    long since scrolled past; '?' re-emits it on demand. Falls back to
+    DEFAULT_LIMITS if the firmware is too old to answer."""
+    limits = dict(DEFAULT_LIMITS)
+    ser.reset_input_buffer()
+    ser.write(b"?\n")
+    deadline = time.time() + timeout
+    got = False
+    while time.time() < deadline:
+        raw = ser.readline().decode("utf-8", errors="replace").strip()
+        if parse_limits_banner(raw, limits):
+            got = True
+            break
+    if not got:
+        print("  [WARN] Board did not report LIMITS (old firmware?); using host defaults.")
+    print(f"  Safety envelope: charge <= {limits['i_charge_max']:.2f} A, "
+          f"discharge <= {limits['i_discharge_max']:.2f} A, "
+          f"V {limits['v_min']:.2f}-{limits['v_max']:.2f} V")
+    return limits
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Serial port helpers
 # ─────────────────────────────────────────────────────────────────────────────
@@ -187,11 +238,19 @@ def configure_thermal_limits(ser):
 # Interactive protocol builder
 # ─────────────────────────────────────────────────────────────────────────────
 
-def build_step(idx):
+def build_step(idx, cap_A, limits):
     """Build one user-facing step. Returns a LIST of protocol steps: usually one,
     but a CC charge with a CV hold expands to two (CC_CHARGE + CV_CHARGE). The CV
     hold is synthesized here as its own visible step so step indices, the protocol
-    summary, and loop ranges all stay consistent."""
+    summary, and loop ranges all stay consistent.
+
+    `cap_A` (cell capacity in A) and `limits` (the board envelope) bound the
+    prompts: absolute current caps become per-cell C-rate ceilings, and the
+    voltage prompts clamp to the LFP over/under-voltage window."""
+    # Absolute A caps -> C-rate caps for THIS cell. floor at a tiny value so a
+    # nonsense capacity can't produce a zero/negative ceiling.
+    crate_chg_max = max(0.01, limits["i_charge_max"]    / cap_A)
+    crate_dis_max = max(0.01, limits["i_discharge_max"] / cap_A)
     print(f"\n  --- Step {idx} ---")
     print("    [1] CC/CV charge   [2] CC discharge   [3] Rest   [4] EIS sweep")
     while True:
@@ -217,13 +276,21 @@ def build_step(idx):
 
     if choice == "1":
         step["type"]           = "CC_CHARGE"
-        step["c_rate"]         = prompt_float("Charge C-rate (e.g. 0.5 = C/2)", 0.5, lo=0.01, hi=5.0)
-        step["voltage_limit"]  = prompt_float("Vmax cutoff (V)", 3.60, lo=2.0, hi=4.3)
+        step["c_rate"]         = prompt_float(
+            f"Charge C-rate (max {crate_chg_max:.3f}C = {limits['i_charge_max']:.2f}A)",
+            min(0.5, crate_chg_max), lo=0.01, hi=crate_chg_max)
+        step["voltage_limit"]  = prompt_float(
+            f"Vmax cutoff (V, {limits['v_min']:.2f}-{limits['v_max']:.2f})",
+            min(3.60, limits["v_max"]), lo=limits["v_min"], hi=limits["v_max"])
         step["duration_min"]   = prompt_float("Time cap in minutes (0 = none, stop on Vmax only)", 0.0, lo=0.0)
     elif choice == "2":
         step["type"]           = "CC_DISCHARGE"
-        step["c_rate"]         = prompt_float("Discharge C-rate (e.g. 1.0 = 1C)", 1.0, lo=0.01, hi=5.0)
-        step["voltage_limit"]  = prompt_float("Vmin cutoff (V)", 2.50, lo=1.5, hi=3.8)
+        step["c_rate"]         = prompt_float(
+            f"Discharge C-rate (max {crate_dis_max:.3f}C = {limits['i_discharge_max']:.2f}A)",
+            min(1.0, crate_dis_max), lo=0.01, hi=crate_dis_max)
+        step["voltage_limit"]  = prompt_float(
+            f"Vmin cutoff (V, floor {limits['v_min']:.2f})",
+            max(2.50, limits["v_min"]), lo=limits["v_min"], hi=limits["v_max"])
         step["duration_min"]   = prompt_float("Time cap in minutes (0 = none, stop on Vmin only)", 0.0, lo=0.0)
     else:  # choice == "3"
         step["type"]           = "REST"
@@ -282,17 +349,20 @@ def describe_step(i, step):
     return "  ".join(parts)
 
 
-def build_protocol():
+def build_protocol(limits=None):
+    if limits is None:
+        limits = dict(DEFAULT_LIMITS)
     print("\n" + "=" * 56)
     print("  New Protocol Builder")
     print("=" * 56)
 
     name        = input("  Protocol name (used for filename): ").strip() or "unnamed"
     capacity_mah = prompt_float("  Cell rated capacity (mAh)", 3000.0, lo=1.0)
+    cap_A = capacity_mah / 1000.0
 
     steps = []
     while True:
-        steps.extend(build_step(len(steps)))
+        steps.extend(build_step(len(steps), cap_A, limits))
         print("\n  Current protocol:")
         for i, s in enumerate(steps):
             print("    " + describe_step(i, s))
@@ -306,7 +376,8 @@ def build_protocol():
             print("    " + describe_step(i, s))
         start_idx = prompt_int("  Loop start step index", 0, lo=0, hi=len(steps) - 1)
         end_idx   = prompt_int("  Loop end step index", len(steps) - 1, lo=start_idx, hi=len(steps) - 1)
-        guard_v   = prompt_float("  Guard voltage — abort loop if crossed at ANY step inside it (V)", 2.50, lo=0.5, hi=4.3)
+        guard_v   = prompt_float("  Guard voltage — abort loop if crossed at ANY step inside it (V)",
+                                 max(2.50, limits["v_min"]), lo=limits["v_min"], hi=limits["v_max"])
         loop = {"start_idx": start_idx, "end_idx": end_idx, "guard_voltage": guard_v}
         print("  Note: firmware caps this at 50 iterations regardless of guard voltage.")
 
@@ -350,6 +421,36 @@ def print_protocol_summary(protocol):
         l = protocol["loop"]
         print(f"  |  Loop: repeat steps {l['start_idx']}-{l['end_idx']} until Vmin={l['guard_voltage']}V (cap 50 iter)")
     print("  +" + "-" * 30)
+
+
+def validate_protocol_limits(protocol, limits):
+    """Return a list of human-readable envelope violations; empty if the whole
+    protocol is in range. Interactively-built protocols pass by construction, but
+    a LOADED or hand-edited JSON bypasses the prompt bounds — this is what catches
+    those before we start sending 'W' commands (a mid-upload firmware reject would
+    desync the host's step indices from the board's)."""
+    eps = 1e-4
+    cap_A = protocol["capacity_mah"] / 1000.0
+    problems = []
+    for i, s in enumerate(protocol["steps"]):
+        t = s["type"]
+        if t in ("CC_CHARGE", "CV_CHARGE"):
+            I = s.get("c_rate", 0.0) * cap_A
+            v = s.get("voltage_limit", 0.0)
+            if I > limits["i_charge_max"] + eps:
+                problems.append(f"step {i} {t}: charge {I:.3f}A > {limits['i_charge_max']:.2f}A cap")
+            if v > limits["v_max"] + eps:
+                problems.append(f"step {i} {t}: Vmax {v:.3f}V > {limits['v_max']:.2f}V ceiling")
+            if v < limits["v_min"] - eps:
+                problems.append(f"step {i} {t}: Vmax {v:.3f}V < {limits['v_min']:.2f}V floor")
+        elif t == "CC_DISCHARGE":
+            I = s.get("c_rate", 0.0) * cap_A
+            v = s.get("voltage_limit", 0.0)
+            if I > limits["i_discharge_max"] + eps:
+                problems.append(f"step {i} {t}: discharge {I:.3f}A > {limits['i_discharge_max']:.2f}A cap")
+            if v < limits["v_min"] - eps:
+                problems.append(f"step {i} {t}: Vmin {v:.3f}V < {limits['v_min']:.2f}V floor")
+    return problems
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -879,6 +980,9 @@ def main():
     print("  Board responding.")
     ser.reset_input_buffer()
 
+    # Fetch the board's safety envelope so the builder can bound inputs to it.
+    limits = fetch_limits(ser)
+
     print("\n  Streaming live readings for ~8s to verify sensors.")
     live_monitor(ser, duration=8.0)
 
@@ -890,11 +994,24 @@ def main():
     if choice == "l":
         protocol = load_protocol()
         if protocol is None:
-            protocol = build_protocol()
+            protocol = build_protocol(limits)
     else:
-        protocol = build_protocol()
+        protocol = build_protocol(limits)
 
     print_protocol_summary(protocol)
+
+    # Final envelope gate before any 'W' goes out. Interactively-built protocols
+    # pass by construction; this catches a loaded/hand-edited JSON that would
+    # otherwise trip the firmware's per-step reject mid-upload and desync indices.
+    problems = validate_protocol_limits(protocol, limits)
+    if problems:
+        print("\n  [ABORT] Protocol exceeds the board safety envelope:")
+        for p in problems:
+            print("    x  " + p)
+        print("  Fix the protocol (or the cell capacity) and retry.")
+        ser.close()
+        sys.exit(1)
+
     if not prompt_yesno("\n  Upload and start this protocol?", default_yes=True):
         print("  Aborted.")
         ser.close()
