@@ -528,11 +528,14 @@ class RunData:
         self.step_idx  = deque(maxlen=maxlen)
         self.loop_iter = deque(maxlen=maxlen)
 
-        # Full history for capacity integration
-        self.all_t     = []
-        self.all_i_ch   = []
-        self.all_i_dis  = []
-        self.all_state  = []
+        # "Full history for capacity integration" — never read anywhere, and as
+        # unbounded lists they grew ~50+ MB/day at the 250 ms DATA rate (OOM risk
+        # on a 1 GB Pi over multi-day runs). The CSV is the full record; bound
+        # these like the rolling buffers until capacity integration exists.
+        self.all_t      = deque(maxlen=maxlen)
+        self.all_i_ch   = deque(maxlen=maxlen)
+        self.all_i_dis  = deque(maxlen=maxlen)
+        self.all_state  = deque(maxlen=maxlen)
 
         self.run_done  = False
         self.fault_msg = ""

@@ -23,8 +23,9 @@ a terminal menu runs one session at a time over a single shared serial connectio
 
   Cycling -> reuses your cycler CLI's control logic (build/load, upload, serial
              reader, CSV) verbatim. The live plot is re-expressed here so the
-             temperature axis keeps a sensible minimum span, and telemetry is
-             echoed to the terminal about once a minute for long runs.
+             temperature axis keeps a sensible minimum span. Telemetry shows
+             as an in-place [LIVE] line (~4 Hz) plus a permanent [TELEM] log
+             line once a minute. --no-plot runs the same session headless.
   EIS     -> 'e' -> banner handshake, then a live window with a large Nyquist
              over a smaller Bode (|Z| + phase), plus optional impedance.py ECM
              fitting. On close it sends 'EXIT' to hand the board back to IDLE.
@@ -33,7 +34,9 @@ Requires:  pyserial, matplotlib, numpy      (cycling + EIS live plots)
 Optional:  impedance, scipy                 (ECM fitting; auto-disabled if absent)
            Your cycler CLI file must sit next to this script (see CYCLER_FILE).
 
-Usage:     python unified_cycler_eis.py
+Usage:     python unified_cycler_eis.py              (live plots)
+           python unified_cycler_eis.py --no-plot    (headless: terminal only;
+                      also automatic when no DISPLAY/WAYLAND_DISPLAY is set)
 """
 
 import csv
@@ -42,18 +45,32 @@ import importlib.util
 import os
 import queue
 import re
+import shutil
 import sys
 import threading
 import time
 import warnings
-import tkinter as tk
 from datetime import datetime
 
+# ── Headless mode: no plot windows, no Tk ────────────────────────────────────
+# --no-plot / --headless, or automatic when there is no display (plain SSH into
+# the Pi). Decided BEFORE the backend is chosen so the Tk/GUI stack is never
+# imported: Agg is a windowless raster backend that is never drawn to here.
+_NO_DISPLAY = sys.platform.startswith("linux") and not (
+    os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+HEADLESS = any(a in ("--no-plot", "--headless") for a in sys.argv[1:]) or _NO_DISPLAY
+
 import matplotlib
-matplotlib.use("TkAgg")   # set before the cycler module imports pyplot
+if HEADLESS:
+    matplotlib.use("Agg")     # set before the cycler module imports pyplot
+    tk = None
+    FigureCanvasTkAgg = None
+else:
+    import tkinter as tk
+    matplotlib.use("TkAgg")   # set before the cycler module imports pyplot
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import matplotlib.ticker as ticker
 from matplotlib.lines import Line2D
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 import numpy as np
 
@@ -79,7 +96,9 @@ except ImportError:
 # ─────────────────────────────────────────────────────────────────────────────
 # Tunables
 # ─────────────────────────────────────────────────────────────────────────────
-CYCLER_TELEMETRY_INTERVAL_S = 60.0   # how often to echo telemetry to the terminal
+CYCLER_TELEMETRY_INTERVAL_S = 60.0   # permanent [TELEM] log line every N s (scrolls)
+CYCLER_LIVE_STATUS_S        = 0.25   # in-place [LIVE] line refresh (~firmware DATA rate)
+CYCLER_STALE_S              = 3.0    # flag [LIVE] as stale if no new DATA for this long
 CYCLER_MIN_TEMP_SPAN_C      = 10.0   # min °C window on the temp plot (de-noises)
 _COOLDOWN_WAIT_S            = 6.0    # must exceed firmware COOLDOWN_MS (5 s)
 
@@ -869,26 +888,79 @@ class EISLiveWindow:
 # ─────────────────────────────────────────────────────────────────────────────
 # Cycling: terminal telemetry printer + custom live plot (temp min-span)
 # ─────────────────────────────────────────────────────────────────────────────
-def telemetry_printer(data, stop_event, interval=CYCLER_TELEMETRY_INTERVAL_S):
-    """Echo the latest cycling telemetry to the terminal about once per minute."""
-    printed_first = False
-    last = 0.0
-    while not stop_event.is_set():
-        time.sleep(1.0)
-        now = time.time()
-        if printed_first and (now - last) < interval:
-            continue
+class StatusConsole:
+    """stdout proxy that keeps ONE live, overwritten status line pinned under
+    normal output. Any ordinary print (from any thread: [FW], [EIS], [TELEM])
+    first erases the status line, writes its text, and the status is redrawn
+    once that line is complete — so log lines scroll normally above it.
+    Only installed on a real TTY; when output is redirected to a file the
+    status line is skipped and only the periodic [TELEM] lines are written."""
+
+    def __init__(self, stream):
+        self._s      = stream
+        self._lock   = threading.RLock()
+        self._status = ""
+        self._shown  = False    # status line currently on screen
+        self._bol    = True     # cursor at start of a line (safe to draw status)
+
+    def write(self, text):
+        with self._lock:
+            if self._shown:
+                self._s.write("\r\033[K")
+                self._shown = False
+            n = self._s.write(text)
+            if text:
+                self._bol = text.endswith("\n")
+                self._draw()
+            return n
+
+    def flush(self):
+        with self._lock:
+            self._s.flush()
+
+    def __getattr__(self, name):          # isatty, fileno, encoding, ...
+        return getattr(self._s, name)
+
+    def set_status(self, text):
+        with self._lock:
+            self._status = text
+            self._draw()
+
+    def close_status(self):
+        """Erase the status line (call before restoring sys.stdout)."""
+        with self._lock:
+            self._status = ""
+            self._draw()
+
+    def _draw(self):
+        # Never draw mid-line: another thread's partial write would be clobbered.
+        if not self._bol:
+            return
+        if self._status:
+            # Truncate to terminal width: a wrapped line can't be fully erased by \r.
+            width = max(20, shutil.get_terminal_size((120, 24)).columns - 1)
+            self._s.write("\r\033[K" + self._status[:width])
+            self._shown = True
+        elif self._shown:
+            self._s.write("\r\033[K")
+            self._shown = False
+        self._s.flush()
+
+
+def telemetry_printer(data, stop_event, console=None,
+                      interval=CYCLER_TELEMETRY_INTERVAL_S,
+                      live_interval=CYCLER_LIVE_STATUS_S):
+    """Two outputs from one snapshot loop:
+      * [LIVE]  — refreshed in place every `live_interval` s (only if `console`)
+      * [TELEM] — a permanent, scrolling line every `interval` s (log record)"""
+    last_log    = None          # host monotonic time of last [TELEM] line
+    last_fw_t   = None          # last firmware elapsed seen
+    last_new_at = time.monotonic()
+    while not stop_event.wait(live_interval):
         with data.lock:
             if not data.t:
                 continue
             state   = data.state[-1] if data.state else "?"
-            # During a blocking EIS step the firmware emits no DATA, lines, so the
-            # arrays are frozen at the last cycler sample from BEFORE the handoff.
-            # Reprinting it every minute is stale and misleading (the voltage is a
-            # leftover ADS reading, not a live one — the sense MUX is on the EIS
-            # board). Skip it; the [FW]/[EIS] sweep lines carry the live output.
-            if state in ("SEQ_EIS", "EIS"):
-                continue
             elapsed = data.t[-1]
             v       = data.v[-1]
             i_ch    = data.i_ch[-1]
@@ -897,13 +969,45 @@ def telemetry_printer(data, stop_event, interval=CYCLER_TELEMETRY_INTERVAL_S):
             t2      = data.temp2[-1]
             step    = data.step_idx[-1]  if data.step_idx  else -1
             loop    = data.loop_iter[-1] if data.loop_iter else 0
-        printed_first = True
-        last = now
+            eis_live = data.eis_live is not None
+
+        now = time.monotonic()
+        if elapsed != last_fw_t:
+            last_fw_t, last_new_at = elapsed, now
+
+        # During a blocking EIS step the firmware emits no DATA, lines, so the
+        # arrays are frozen at the last cycler sample from BEFORE the handoff.
+        # Don't present it as live/log it (the sense MUX is on the EIS path);
+        # the [FW]/[EIS] sweep lines carry the live output.
+        if state in ("SEQ_EIS", "EIS") or eis_live:
+            if console is not None:
+                console.set_status("  [LIVE] EIS sweep running — cycler telemetry paused")
+            continue
+
         mm, ss = divmod(int(elapsed), 60)
         hh, mm = divmod(mm, 60)
-        print(f"\n  [TELEM {hh:02d}:{mm:02d}:{ss:02d}] {state:<11} "
-              f"V={v:.4f}  I_ch={i_ch:.3f}  I_dis={i_dis:.3f}  "
-              f"T_nmos={t1:.1f}C  T_batt={t2:.1f}C  step={step} loop={loop}")
+        body = (f"{state:<11} V={v:.4f}  I_ch={i_ch:.3f}  I_dis={i_dis:.3f}  "
+                f"T_nmos={t1:.1f}C  T_batt={t2:.1f}C  step={step} loop={loop}")
+        stamp = f"{hh:02d}:{mm:02d}:{ss:02d}"
+
+        if last_log is None or (now - last_log) >= interval:
+            last_log = now
+            print(f"  [TELEM {stamp}] {body}")
+
+        if console is not None:
+            age = now - last_new_at
+            stale = f"  (stale {age:.0f}s)" if age >= CYCLER_STALE_S else ""
+            console.set_status(f"  [LIVE  {stamp}] {body}{stale}")
+
+
+def wait_headless(data, stop_event):
+    """Headless stand-in for the plot loop: block until the run finishes,
+    faults (stop_event), or Ctrl+C. Unlike the plot (which waits for the
+    window to close), this returns as soon as the sequence completes."""
+    while not stop_event.wait(0.5):
+        with data.lock:
+            if data.run_done:
+                return
 
 
 def _style_eis_axes(ax_nyq, ax_mag, ax_phase):
@@ -1320,14 +1424,29 @@ def run_cycler_session(ser):
         daemon=True)
     reader.start()
 
-    telem = threading.Thread(
-        target=telemetry_printer, args=(data, stop_event), daemon=True)
-    telem.start()
+    # Live in-place status line only on a real terminal (not when redirected).
+    console = None
+    orig_stdout = sys.stdout
+    if sys.stdout.isatty():
+        console = StatusConsole(orig_stdout)
 
-    print(f"\n  Run started. Telemetry prints ~every {int(CYCLER_TELEMETRY_INTERVAL_S)}s.")
-    print("  Close the plot window or Ctrl+C to stop early.\n")
+    print(f"\n  Run started. [TELEM] logs every {int(CYCLER_TELEMETRY_INTERVAL_S)}s"
+          + ("; [LIVE] line updates in place." if console else "."))
+    if HEADLESS:
+        print("  Headless (no plot). Ctrl+C to stop early; exits when the sequence ends.\n")
+    else:
+        print("  Close the plot window or Ctrl+C to stop early.\n")
+
+    if console is not None:
+        sys.stdout = console
+    telem = threading.Thread(
+        target=telemetry_printer, args=(data, stop_event, console), daemon=True)
+    telem.start()
     try:
-        run_cycler_plot(data, protocol, stop_event)
+        if HEADLESS:
+            wait_headless(data, stop_event)
+        else:
+            run_cycler_plot(data, protocol, stop_event)
     except KeyboardInterrupt:
         print("\n  Interrupted by user.")
     finally:
@@ -1338,6 +1457,9 @@ def run_cycler_session(ser):
             pass
         reader.join(timeout=3)
         telem.join(timeout=2)
+        if console is not None:
+            console.close_status()
+            sys.stdout = orig_stdout
         csv_fh.close()
 
     with data.lock:
@@ -1355,10 +1477,15 @@ def run_cycler_session(ser):
         print(f"  {n_eis} interleaved EIS sweep(s) saved next to the run CSV.")
     print("=" * 56)
 
-    plt.close("all")
+    if not HEADLESS:
+        plt.close("all")
 
 
 def run_eis_session(ser):
+    if HEADLESS:
+        print("  Standalone EIS uses a Tk window — unavailable in headless mode.")
+        print("  (Interleaved EIS steps inside a cycling protocol still run and save.)")
+        return
     if not enter_eis_mode(ser):
         print("  Could not enter EIS mode — staying on the cycler side.")
         ser.reset_input_buffer()
@@ -1379,6 +1506,9 @@ def main():
     print("=" * 60)
     if not IMPEDANCE_AVAILABLE:
         print("  (ECM fitting off: 'impedance' / 'scipy' not installed.)")
+    if HEADLESS:
+        why = "no display detected" if _NO_DISPLAY else "--no-plot"
+        print(f"  Headless mode ({why}): live plots off, terminal telemetry only.")
 
     print("\n  Scanning for serial ports...")
     port = cyc.find_serial_port()
@@ -1401,8 +1531,10 @@ def main():
         while True:
             print("\n" + "-" * 60)
             print("  Main menu")
-            print("    [1] Auto-cycling & EIS  (build/load protocol, run + live plots)")
-            print("    [2] EIS measurement  (live Nyquist/Bode sweep)")
+            print("    [1] Auto-cycling & EIS  (build/load protocol, run"
+                  + (", headless)" if HEADLESS else " + live plots)"))
+            print("    [2] EIS measurement  (live Nyquist/Bode sweep)"
+                  + ("  — needs a display" if HEADLESS else ""))
             print("    [q] Quit")
             choice = input("  Select [1/2/q]: ").strip().lower()
             if choice == "1":
