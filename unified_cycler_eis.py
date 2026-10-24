@@ -34,6 +34,10 @@ Requires:  pyserial, matplotlib, numpy      (cycling + EIS live plots)
 Optional:  impedance, scipy                 (ECM fitting; auto-disabled if absent)
            Your cycler CLI file must sit next to this script (see CYCLER_FILE).
 
+Idle log:  menu [3] passively logs V + temperatures from IDLE (no commands sent,
+             force path stays open) — for a cell being cycled by another
+             instrument. Bounded duration; wall-clock timestamps for alignment.
+
 Usage:     python unified_cycler_eis.py              (live plots)
            python unified_cycler_eis.py --no-plot    (headless: terminal only;
                       also automatic when no DISPLAY/WAYLAND_DISPLAY is set)
@@ -46,11 +50,13 @@ import os
 import queue
 import re
 import shutil
+import socket
+import subprocess
 import sys
 import threading
 import time
 import warnings
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # ── Headless mode: no plot windows, no Tk ────────────────────────────────────
 # --no-plot / --headless, or automatic when there is no display (plain SSH into
@@ -99,6 +105,16 @@ except ImportError:
 CYCLER_TELEMETRY_INTERVAL_S = 60.0   # permanent [TELEM] log line every N s (scrolls)
 CYCLER_LIVE_STATUS_S        = 0.25   # in-place [LIVE] line refresh (~firmware DATA rate)
 CYCLER_STALE_S              = 3.0    # flag [LIVE] as stale if no new DATA for this long
+
+# Idle log (menu 3): passive V/T monitor of a cell driven by ANOTHER instrument
+IDLE_LOG_DEFAULT_INTERVAL_S = 1.0    # mean of each window; 0 = raw firmware samples
+IDLE_LOG_DEFAULT_HOURS      = 24.0   # always bounded — never runs open-ended
+IDLE_LOG_MAX_HOURS          = 24.0 * 30
+IDLE_LOG_VMIN_WARN          = 1.0    # below this a sense lead / GND tie is likely off
+IDLE_LOG_TBATT_WARN_C       = 45.0   # warn only: this board can't act on the cell
+IDLE_LOG_STALE_WARN_S       = 10.0   # warn if no DATA for this long
+_FW_IDLE_SAMPLE_S           = 0.25   # firmware LOG_INTERVAL_MS while IDLE
+_IDLE_ROW_BYTES             = 95     # approx CSV row size, for the size estimate
 CYCLER_MIN_TEMP_SPAN_C      = 10.0   # min °C window on the temp plot (de-noises)
 _COOLDOWN_WAIT_S            = 6.0    # must exceed firmware COOLDOWN_MS (5 s)
 
@@ -1498,6 +1514,234 @@ def run_eis_session(ser):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Idle log: passive voltage/temperature monitor (cell driven by another cycler)
+# ─────────────────────────────────────────────────────────────────────────────
+# Host-only: in IDLE the firmware already has the relays open, the sense MUX on
+# the ADS1115 and emits DATA every 250 ms. This session only listens — it sends
+# NO commands, so nothing on the board changes state while it runs.
+
+def _parse_idle_data(line):
+    """DATA,... -> (state, v_batt, t_board, t_batt) or None. Currents ignored."""
+    if not line.startswith("DATA,"):
+        return None
+    p = line.split(",")
+    if len(p) != 10:
+        return None
+    try:
+        return p[2], float(p[3]), float(p[6]), float(p[7])
+    except ValueError:
+        return None
+
+
+def _sample_idle(ser, seconds):
+    """Collect parsed DATA samples for `seconds` (pre-flight check)."""
+    out, end = [], time.monotonic() + seconds
+    while time.monotonic() < end:
+        raw = ser.readline()
+        if raw:
+            d = _parse_idle_data(raw.decode("utf-8", errors="replace").strip())
+            if d:
+                out.append(d)
+    return out
+
+
+def _ntp_synced():
+    """True/False from systemd's timedatectl, or None if it can't be determined."""
+    exe = shutil.which("timedatectl")
+    if not exe:
+        return None
+    try:
+        out = subprocess.run([exe, "show", "-p", "NTPSynchronized", "--value"],
+                             capture_output=True, text=True, timeout=3).stdout.strip()
+    except Exception:
+        return None
+    return {"yes": True, "no": False}.get(out)
+
+
+def run_idle_log_session(ser):
+    print("\n  Idle log — passive V/T monitor (no current; board stays IDLE, sends nothing).")
+    ser.reset_input_buffer()
+    pre = _sample_idle(ser, 1.5)
+    if not pre:
+        print("  [ERROR] No DATA from the board.")
+        return
+    states = sorted({d[0] for d in pre})
+    if states != ["IDLE"]:
+        print(f"  [ERROR] Board is not IDLE ({', '.join(states)}). Idle logging only runs from")
+        print("  IDLE so it can't drive the cell. Stop / clear the board first, then retry.")
+        return
+    v_now  = sorted(d[1] for d in pre)[len(pre) // 2]     # median: robust to one bad read
+    tb_now, tbat_now = pre[-1][2], pre[-1][3]
+    print(f"  Sense check: V={v_now:.4f} V  T_batt={tbat_now:.1f}C  T_board={tb_now:.1f}C")
+    if v_now < IDLE_LOG_VMIN_WARN:
+        print(f"  [ERROR] V < {IDLE_LOG_VMIN_WARN:.1f} V — sense leads or the GND tie aren't on the cell.")
+        return
+
+    ntp = _ntp_synced()
+    if ntp is False:
+        print("  [WARN] System clock is NOT NTP-synchronized. Wall-clock timestamps are what")
+        print("         align this log with the other cycler's data (the Pi 3 has no RTC).")
+        if not cyc.prompt_yesno("Continue anyway?", default_yes=False):
+            return
+    elif ntp is None:
+        print("  (Couldn't check NTP sync — make sure the system clock is correct.)")
+
+    name = re.sub(r"[^\w.-]+", "_", input("    Log name [idle]: ").strip()) or "idle"
+    interval = cyc.prompt_float("Log interval s (mean of each window; 0 = raw 250 ms)",
+                                IDLE_LOG_DEFAULT_INTERVAL_S, lo=0.0, hi=3600.0)
+    hours = cyc.prompt_float("Duration in hours (stops automatically)",
+                             IDLE_LOG_DEFAULT_HOURS, lo=0.01, hi=IDLE_LOG_MAX_HOURS)
+    ref_v = None
+    raw = input("    Other cycler's V reading right now, for offset (blank = skip): ").strip()
+    if raw:
+        try:
+            ref_v = float(raw)
+        except ValueError:
+            print("      (not a number — skipped)")
+
+    rows_per_s = 1.0 / max(interval, _FW_IDLE_SAMPLE_S)
+    est_mb = rows_per_s * hours * 3600 * _IDLE_ROW_BYTES / 1e6
+    end_at = datetime.now() + timedelta(hours=hours)
+    print(f"\n  {('raw 250 ms samples' if interval <= 0 else f'{interval:g} s means')}"
+          f" for {hours:g} h (until {end_at:%Y-%m-%d %H:%M}), about {est_mb:.1f} MB.")
+    if not cyc.prompt_yesno("Start idle logging?", default_yes=True):
+        return
+
+    start = datetime.now()
+    fn = f"idle_{name}_{start:%Y%m%d_%H%M%S}.csv"
+    fh = open(fn, "w", newline="")
+    wr = csv.writer(fh)
+    # Comment lines written raw (csv.writer may quote them, which breaks
+    # pandas.read_csv(comment="#")).
+    fh.write("# Idle log - passive monitor; no current measured; board IDLE, force path open\n")
+    fh.write(f"# started={start.isoformat(timespec='seconds')}  host={socket.gethostname()}"
+             f"  ntp_synced={ntp}\n")
+    fh.write(f"# interval_s={interval:g} (0=raw)  duration_h={hours:g}"
+             "  timestamp=mean receipt time of the samples in each row\n")
+    if ref_v is not None:
+        fh.write(f"# ref_v_other_cycler={ref_v:.4f}  board_v={v_now:.4f}"
+                 f"  offset_board_minus_ref={v_now - ref_v:+.4f}\n")
+    wr.writerow(["wallclock_iso", "unix_s", "elapsed_s", "v_batt", "v_min", "v_max",
+                 "temp_batt_c", "temp_board_c", "n_samples"])
+    fh.flush()
+    print(f"  Logging to: {os.path.abspath(fn)}")
+    print(f"  [TELEM] logs every {int(CYCLER_TELEMETRY_INTERVAL_S)}s. Ctrl+C to stop early.\n")
+
+    console = StatusConsole(sys.stdout) if sys.stdout.isatty() else None
+    orig_stdout = sys.stdout
+    if console is not None:
+        sys.stdout = console
+
+    t0      = time.monotonic()
+    end_mon = t0 + hours * 3600.0
+    acc     = []          # (unix_s, mono, v, t_batt, t_board) for the current window
+    win_idx = 0
+    rows    = 0
+    last_rx = t0
+    last_telem = None
+    warn_v = warn_t = warn_stale = False
+    reason = "duration reached"
+
+    def write_window():
+        nonlocal rows, acc
+        if not acc:
+            return
+        n  = len(acc)
+        ts = sum(a[0] for a in acc) / n
+        mo = sum(a[1] for a in acc) / n
+        vs = [a[2] for a in acc]
+        wr.writerow([datetime.fromtimestamp(ts).isoformat(timespec="milliseconds"),
+                     f"{ts:.3f}", f"{mo - t0:.3f}",
+                     f"{sum(vs) / n:.5f}", f"{min(vs):.4f}", f"{max(vs):.4f}",
+                     f"{sum(a[3] for a in acc) / n:.2f}",
+                     f"{sum(a[4] for a in acc) / n:.2f}", n])
+        fh.flush()
+        rows += 1
+        acc = []
+
+    ser.reset_input_buffer()   # drop samples that queued up during the prompts
+    try:
+        while True:
+            now = time.monotonic()
+            if now >= end_mon:
+                break
+            if not warn_stale and now - last_rx >= IDLE_LOG_STALE_WARN_S:
+                warn_stale = True
+                print(f"  [WARN] No DATA for {now - last_rx:.0f}s — USB link / board?")
+            try:
+                raw = ser.readline()
+            except serial.SerialException:
+                reason = "serial connection lost"
+                break
+            if not raw:
+                continue
+            line = raw.decode("utf-8", errors="replace").strip()
+            if line.startswith("MSG,"):
+                print(f"  [FW] {line[4:]}")
+                continue
+            d = _parse_idle_data(line)
+            if d is None:
+                continue
+            state, v, t_board, t_batt = d
+            now = time.monotonic()
+            last_rx = now
+            if warn_stale:
+                warn_stale = False
+                print("  [INFO] DATA resumed.")
+            if state != "IDLE":
+                reason = f"board left IDLE ({state}) — stopped so the log stays passive"
+                break
+
+            # Windowing on a fixed grid from t0 (raw mode: one row per sample).
+            if interval > 0:
+                idx = int((now - t0) // interval)
+                if idx != win_idx:
+                    write_window()
+                    win_idx = idx
+            acc.append((time.time(), now, v, t_batt, t_board))
+            if interval <= 0:
+                write_window()
+
+            # Warnings latch per episode (log the data regardless).
+            if v < IDLE_LOG_VMIN_WARN and not warn_v:
+                warn_v = True
+                print(f"  [WARN] V={v:.3f} V — sense lead or GND tie off the cell?")
+            elif warn_v and v >= IDLE_LOG_VMIN_WARN + 0.1:
+                warn_v = False
+                print(f"  [INFO] V back to {v:.3f} V.")
+            if t_batt >= IDLE_LOG_TBATT_WARN_C and not warn_t:
+                warn_t = True
+                print(f"  [WARN] T_batt={t_batt:.1f}C >= {IDLE_LOG_TBATT_WARN_C:.0f}C "
+                      "(monitor only — this board can't act on the cell).")
+            elif warn_t and t_batt < IDLE_LOG_TBATT_WARN_C - 2.0:
+                warn_t = False
+
+            el = int(now - t0)
+            rem = max(0, int(end_mon - now))
+            stamp = f"{el // 3600:02d}:{el % 3600 // 60:02d}:{el % 60:02d}"
+            body = (f"V={v:.4f}  T_batt={t_batt:.1f}C  T_board={t_board:.1f}C  "
+                    f"rows={rows}  left={rem // 3600}h{rem % 3600 // 60:02d}m")
+            if last_telem is None or now - last_telem >= CYCLER_TELEMETRY_INTERVAL_S:
+                last_telem = now
+                print(f"  [TELEM {stamp}] {body}")
+            if console is not None:
+                console.set_status(f"  [IDLE  {stamp}] {body}")
+    except KeyboardInterrupt:
+        reason = "stopped by user"
+    finally:
+        write_window()            # flush the partial last window
+        fh.close()
+        if console is not None:
+            console.close_status()
+            sys.stdout = orig_stdout
+
+    print("\n" + "=" * 56)
+    print(f"  Idle log ended: {reason}.")
+    print(f"  {rows} rows -> {os.path.abspath(fn)}")
+    print("=" * 56)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Main menu
 # ─────────────────────────────────────────────────────────────────────────────
 def main():
@@ -1535,16 +1779,19 @@ def main():
                   + (", headless)" if HEADLESS else " + live plots)"))
             print("    [2] EIS measurement  (live Nyquist/Bode sweep)"
                   + ("  — needs a display" if HEADLESS else ""))
+            print("    [3] Idle log  (passive V/T monitor, no current — cell on another cycler)")
             print("    [q] Quit")
-            choice = input("  Select [1/2/q]: ").strip().lower()
+            choice = input("  Select [1/2/3/q]: ").strip().lower()
             if choice == "1":
                 run_cycler_session(ser)
             elif choice == "2":
                 run_eis_session(ser)
+            elif choice == "3":
+                run_idle_log_session(ser)
             elif choice == "q":
                 break
             else:
-                print("  Enter 1, 2, or q.")
+                print("  Enter 1, 2, 3, or q.")
     except KeyboardInterrupt:
         print("\n  Interrupted.")
     finally:
