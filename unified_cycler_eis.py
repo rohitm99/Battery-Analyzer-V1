@@ -41,6 +41,9 @@ Idle log:  menu [3] passively logs V + temperatures from IDLE (no commands sent,
 Usage:     python unified_cycler_eis.py              (live plots)
            python unified_cycler_eis.py --no-plot    (headless: terminal only;
                       also automatic when no DISPLAY/WAYLAND_DISPLAY is set)
+           --data-dir PATH   where run / EIS-sweep / idle-log CSVs go (created
+                      if missing; default: current directory). Changeable
+                      from the menu with [d].
 """
 
 import csv
@@ -1619,7 +1622,7 @@ def run_idle_log_session(ser, info=None):
         return
 
     start = datetime.now()
-    fn = f"idle_{name}_{start:%Y%m%d_%H%M%S}.csv"
+    fn = os.path.join(cyc.DATA_DIR, f"idle_{name}_{start:%Y%m%d_%H%M%S}.csv")
     fh = open(fn, "w", newline="")
     wr = csv.writer(fh)
     fw = (info or {}).get("fw_version") or "unknown"
@@ -1765,6 +1768,10 @@ def main():
     if HEADLESS:
         why = "no display detected" if _NO_DISPLAY else "--no-plot"
         print(f"  Headless mode ({why}): live plots off, terminal telemetry only.")
+    dd = cyc.data_dir_from_argv(sys.argv[1:])
+    if dd is not None and cyc.set_data_dir(dd) is None:
+        sys.exit(1)
+    print(f"  Data directory: {os.path.abspath(cyc.DATA_DIR)}")
 
     print("\n  Scanning for serial ports...")
     port = cyc.find_serial_port()
@@ -1793,18 +1800,23 @@ def main():
             print("    [2] EIS measurement  (live Nyquist/Bode sweep)"
                   + ("  — needs a display" if HEADLESS else ""))
             print("    [3] Idle log  (passive V/T monitor, no current — cell on another cycler)")
+            print(f"    [d] Data directory  ({os.path.abspath(cyc.DATA_DIR)})")
             print("    [q] Quit")
-            choice = input("  Select [1/2/3/q]: ").strip().lower()
+            choice = input("  Select [1/2/3/d/q]: ").strip().lower()
             if choice == "1":
                 run_cycler_session(ser, info)
             elif choice == "2":
                 run_eis_session(ser)
+            elif choice == "d":
+                new = input("  New data directory (blank = keep): ").strip()
+                if new and cyc.set_data_dir(new):
+                    print(f"  Data will be saved to: {cyc.DATA_DIR}")
             elif choice == "3":
                 run_idle_log_session(ser, info)
             elif choice == "q":
                 break
             else:
-                print("  Enter 1, 2, 3, or q.")
+                print("  Enter 1, 2, 3, d, or q.")
     except KeyboardInterrupt:
         print("\n  Interrupted.")
     finally:

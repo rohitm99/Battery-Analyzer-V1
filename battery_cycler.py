@@ -9,7 +9,9 @@ firmware as raw current values (C-rate math happens here, not on the MCU),
 then monitors, plots, and logs the run.
 
 Usage:
-    python battery_cycler.py
+    python battery_cycler.py [--data-dir PATH]
+        --data-dir   where run CSVs and EIS sweep files are written
+                     (created if missing; default: the current directory)
 """
 
 import serial
@@ -18,6 +20,7 @@ import threading
 import time
 import csv
 import os
+import re
 import sys
 import glob
 import json
@@ -92,6 +95,44 @@ LOOP_LEGACY_PASSES     = 50     # what pre-count firmware always did
 LOOP_GUARD_MARGIN_V    = 0.10   # default guard sits this far below the loop's
                                 # lowest discharge cutoff (IR sag under load)
 FW_MAX_STEPS           = 20     # firmware MAX_STEPS
+
+
+# ── Output location ──────────────────────────────────────────────────────────
+# Run CSVs (and the EIS sweep files saved next to them) go here. "." keeps the
+# old behaviour (current directory). Set with --data-dir or set_data_dir().
+DATA_DIR = "."
+
+
+def set_data_dir(path):
+    """Expand ~, create the directory if needed, check it's writable, and make
+    it the output directory. Returns the absolute path, or None on failure."""
+    global DATA_DIR
+    p = os.path.abspath(os.path.expanduser(path.strip()))
+    try:
+        os.makedirs(p, exist_ok=True)
+    except OSError as e:
+        print(f"  [ERROR] Cannot create data directory {p}: {e}")
+        return None
+    try:                                   # real write probe (catches read-only
+        probe = os.path.join(p, ".write_test")   # mounts, not just permissions)
+        with open(probe, "w") as f:
+            f.write("ok")
+        os.remove(probe)
+    except OSError as e:
+        print(f"  [ERROR] Data directory is not writable: {p} ({e})")
+        return None
+    DATA_DIR = p
+    return p
+
+
+def data_dir_from_argv(argv):
+    """Value of --data-dir PATH / --data-dir=PATH in argv, or None."""
+    for i, a in enumerate(argv):
+        if a == "--data-dir" and i + 1 < len(argv):
+            return argv[i + 1]
+        if a.startswith("--data-dir="):
+            return a.split("=", 1)[1]
+    return None
 
 
 def parse_limits_banner(line, limits):
@@ -850,7 +891,8 @@ def serial_reader(ser, data: RunData, csv_writer, csv_file, stop_event: threadin
 
 def open_csv(protocol, fw_version=None):
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    fn = f"run_{protocol['name']}_{ts}.csv"
+    safe = re.sub(r"[^\w.-]+", "_", str(protocol["name"])) or "unnamed"
+    fn = os.path.join(DATA_DIR, f"run_{safe}_{ts}.csv")
     fh = open(fn, "w", newline="")
     wr = csv.writer(fh)
     wr.writerow(["# Battery Cycler sequence run — " + ts])
@@ -1049,6 +1091,10 @@ def main():
     print("\n" + "=" * 56)
     print("  Battery Cycler CLI — Sequence Edition")
     print("=" * 56)
+    dd = data_dir_from_argv(sys.argv[1:])
+    if dd is not None and set_data_dir(dd) is None:
+        sys.exit(1)
+    print(f"  Data directory: {os.path.abspath(DATA_DIR)}")
 
     print("\n  Scanning for serial ports...")
     port = find_serial_port()
