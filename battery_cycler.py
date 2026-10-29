@@ -748,7 +748,15 @@ def serial_reader(ser, data: RunData, csv_writer, csv_file, stop_event: threadin
               f"{'saved ' + os.path.basename(path) if path else '(unsaved)'}        ")
         eis_cur = None
 
+    # The firmware prints a fault as a header line followed by its REASON lines
+    # ("  -> Charge over-current", ...). Keep reading briefly after the header so
+    # those are shown and logged, then stop.
+    fault_deadline = None
+
     while not stop_event.is_set():
+        if fault_deadline is not None and time.time() >= fault_deadline:
+            stop_event.set()
+            break
         try:
             raw = ser.readline()
         except serial.SerialException:
@@ -775,12 +783,15 @@ def serial_reader(ser, data: RunData, csv_writer, csv_file, stop_event: threadin
                 csv_file.flush()
             except Exception:
                 pass
-            if "FAULT" in msg.upper():
+            if fault_deadline is not None and msg.lstrip().startswith("->"):
+                with data.lock:          # reason line(s) for the fault just seen
+                    data.fault_msg += "  " + msg.strip()
+            elif "FAULT" in msg.upper() and fault_deadline is None:
                 _finalize_eis()          # flush any partial EIS sweep before stopping
                 with data.lock:
                     data.fault_msg = msg
                     data.run_done  = True
-                stop_event.set()
+                fault_deadline = time.time() + 1.0   # collect the reason lines
             elif "Sequence complete" in msg or "Loop guard" in msg:
                 _finalize_eis()
                 with data.lock:
