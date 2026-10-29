@@ -1401,7 +1401,7 @@ def configure_overcurrent(ser, protocol):
         print(f"  Sent F{fault_A:.3f} (no ack seen — verify in the run log).")
 
 
-def run_cycler_session(ser):
+def run_cycler_session(ser, info):
     """Reuse the cycler CLI's control logic on the shared port, with terminal
     telemetry and the min-span temperature plot."""
     import matplotlib.pyplot as plt
@@ -1415,10 +1415,20 @@ def run_cycler_session(ser):
     print("\n  Build a new protocol, or load a saved one?")
     print("    [n] New   [l] Load")
     choice = input("  Select [n/l]: ").strip().lower()
-    protocol = (cyc.load_protocol() or cyc.build_protocol()) if choice == "l" \
-        else cyc.build_protocol()
+    limits = info["limits"]
+    protocol = (cyc.load_protocol() or cyc.build_protocol(limits)) if choice == "l" \
+        else cyc.build_protocol(limits)
 
     cyc.print_protocol_summary(protocol)
+    # Same envelope gate the standalone CLI applies (catches loaded / hand-edited
+    # JSON, a guard at the discharge cutoff, too many steps) before any upload.
+    problems = cyc.validate_protocol_limits(protocol, limits)
+    if problems:
+        print("\n  [ABORT] Protocol problems:")
+        for p_ in problems:
+            print("    x  " + p_)
+        print("  Fix the protocol and retry — returning to menu.")
+        return
     if not cyc.prompt_yesno("\n  Upload and start this protocol?", default_yes=True):
         print("  Aborted — returning to menu.")
         return
@@ -1429,9 +1439,10 @@ def run_cycler_session(ser):
     configure_overcurrent(ser, protocol)
 
     ser.reset_input_buffer()
-    cyc.upload_protocol(ser, protocol)
+    if not cyc.upload_protocol(ser, protocol):
+        return
 
-    csv_fh, csv_wr = cyc.open_csv(protocol)
+    csv_fh, csv_wr = cyc.open_csv(protocol, info["fw_version"])
     data = cyc.RunData()
     stop_event = threading.Event()
 
@@ -1558,7 +1569,7 @@ def _ntp_synced():
     return {"yes": True, "no": False}.get(out)
 
 
-def run_idle_log_session(ser):
+def run_idle_log_session(ser, info=None):
     print("\n  Idle log — passive V/T monitor (no current; board stays IDLE, sends nothing).")
     ser.reset_input_buffer()
     pre = _sample_idle(ser, 1.5)
@@ -1611,11 +1622,12 @@ def run_idle_log_session(ser):
     fn = f"idle_{name}_{start:%Y%m%d_%H%M%S}.csv"
     fh = open(fn, "w", newline="")
     wr = csv.writer(fh)
+    fw = (info or {}).get("fw_version") or "unknown"
     # Comment lines written raw (csv.writer may quote them, which breaks
     # pandas.read_csv(comment="#")).
     fh.write("# Idle log - passive monitor; no current measured; board IDLE, force path open\n")
     fh.write(f"# started={start.isoformat(timespec='seconds')}  host={socket.gethostname()}"
-             f"  ntp_synced={ntp}\n")
+             f"  ntp_synced={ntp}  fw_version={fw}\n")
     fh.write(f"# interval_s={interval:g} (0=raw)  duration_h={hours:g}"
              "  timestamp=mean receipt time of the samples in each row\n")
     if ref_v is not None:
@@ -1770,6 +1782,7 @@ def main():
         ser.close()
         sys.exit(1)
     print("  Board responding.")
+    info = cyc.fetch_board_info(ser)     # firmware version + safety envelope
 
     try:
         while True:
@@ -1783,11 +1796,11 @@ def main():
             print("    [q] Quit")
             choice = input("  Select [1/2/3/q]: ").strip().lower()
             if choice == "1":
-                run_cycler_session(ser)
+                run_cycler_session(ser, info)
             elif choice == "2":
                 run_eis_session(ser)
             elif choice == "3":
-                run_idle_log_session(ser)
+                run_idle_log_session(ser, info)
             elif choice == "q":
                 break
             else:

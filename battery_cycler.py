@@ -86,6 +86,14 @@ DEFAULT_LIMITS = {
     "v_min":           2.10,   # V
 }
 
+# ── Repeat loop ─────────────────────────────────────────────────────────────
+LOOP_MAX_PASSES        = 1000   # must match firmware MAX_LOOP_ITER
+LOOP_LEGACY_PASSES     = 50     # what pre-count firmware always did
+LOOP_GUARD_MARGIN_V    = 0.10   # default guard sits this far below the loop's
+                                # lowest discharge cutoff (IR sag under load)
+FW_MAX_STEPS           = 20     # firmware MAX_STEPS
+
+
 def parse_limits_banner(line, limits):
     """Update `limits` in place from a firmware 'LIMITS,...' line.
     Returns True if the line was a well-formed LIMITS banner."""
@@ -102,27 +110,38 @@ def parse_limits_banner(line, limits):
         return False
 
 
-def fetch_limits(ser, timeout=2.0):
-    """Ask the board for its safety envelope via '?' and parse the LIMITS banner.
-    The host opens the port with DTR/RTS low (no reset), so the boot banner has
-    long since scrolled past; '?' re-emits it on demand. Falls back to
-    DEFAULT_LIMITS if the firmware is too old to answer."""
+def fetch_board_info(ser, timeout=2.0, attempts=2):
+    """Ask the board '?' and parse its reply: FWVER,<v> (current firmware sends
+    it BEFORE the LIMITS line) and LIMITS,<...>. Stops as soon as LIMITS arrives.
+    Retried once, because '?' can race the DATA stream right after connect.
+    Returns {"limits": {...}, "fw_version": str or None}."""
     limits = dict(DEFAULT_LIMITS)
-    ser.reset_input_buffer()
-    ser.write(b"?\n")
-    deadline = time.time() + timeout
-    got = False
-    while time.time() < deadline:
-        raw = ser.readline().decode("utf-8", errors="replace").strip()
-        if parse_limits_banner(raw, limits):
-            got = True
+    fw, got = None, False
+    for _ in range(attempts):
+        ser.reset_input_buffer()
+        ser.write(b"?\n")
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            raw = ser.readline().decode("utf-8", errors="replace").strip()
+            if raw.startswith("FWVER,"):
+                fw = raw[6:].strip() or None
+            elif parse_limits_banner(raw, limits):
+                got = True
+                break
+        if got:
             break
     if not got:
         print("  [WARN] Board did not report LIMITS (old firmware?); using host defaults.")
+    print(f"  Firmware version: {fw if fw else 'unknown (firmware does not report it on ?)'}")
     print(f"  Safety envelope: charge <= {limits['i_charge_max']:.2f} A, "
           f"discharge <= {limits['i_discharge_max']:.2f} A, "
           f"V {limits['v_min']:.2f}-{limits['v_max']:.2f} V")
-    return limits
+    return {"limits": limits, "fw_version": fw}
+
+
+def fetch_limits(ser, timeout=2.0):
+    """Back-compat wrapper: limits only."""
+    return fetch_board_info(ser, timeout)["limits"]
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Serial port helpers
@@ -349,6 +368,46 @@ def describe_step(i, step):
     return "  ".join(parts)
 
 
+def _loop_lowest_cutoff(steps, start_idx, end_idx):
+    """Lowest CC_DISCHARGE cutoff inside the loop range, or None."""
+    cuts = [st.get("voltage_limit", 0.0) for st in steps[start_idx:end_idx + 1]
+            if st.get("type") == "CC_DISCHARGE" and st.get("voltage_limit", 0.0) > 0]
+    return min(cuts) if cuts else None
+
+
+def prompt_loop_guard(steps, start_idx, end_idx, limits):
+    """Guard voltage: a SAFETY stop that ends the whole run if v_batt falls to it
+    at any step inside the loop. It must sit below every discharge cutoff in the
+    loop — the firmware checks the guard before the step's own cutoff, so a guard
+    equal to the cutoff ends the run at the first discharge. 0 disables it."""
+    lowest = _loop_lowest_cutoff(steps, start_idx, end_idx)
+    if lowest is not None:
+        default = round(max(lowest - LOOP_GUARD_MARGIN_V, 0.6), 2)
+        print(f"  Lowest discharge cutoff in the loop: {lowest:.3f} V")
+    else:
+        default = max(2.50, limits["v_min"])
+    while True:
+        g = prompt_float("Guard voltage — ends the WHOLE run if V falls to it in the loop "
+                         "(0 = off)", default, lo=0.0, hi=limits["v_max"])
+        if g == 0.0 or lowest is None or g < lowest:
+            return g
+        print(f"      x  Must be below {lowest:.3f} V (the loop's lowest discharge cutoff),"
+              " or 0 — otherwise it ends the run at the first discharge.")
+
+
+def ensure_loop_count(protocol):
+    """Saved protocols from before the pass count existed have none; the old
+    firmware behaviour was 50 passes. Ask rather than silently assume."""
+    loop = protocol.get("loop")
+    if loop and "count" not in loop:
+        print(f"\n  This saved protocol's loop (steps {loop['start_idx']}-{loop['end_idx']}) "
+              "has no pass count")
+        print(f"  (older files ran until the guard voltage or {LOOP_LEGACY_PASSES} passes).")
+        loop["count"] = prompt_int("Number of passes", LOOP_LEGACY_PASSES,
+                                   lo=1, hi=LOOP_MAX_PASSES)
+    return protocol
+
+
 def build_protocol(limits=None):
     if limits is None:
         limits = dict(DEFAULT_LIMITS)
@@ -376,10 +435,11 @@ def build_protocol(limits=None):
             print("    " + describe_step(i, s))
         start_idx = prompt_int("  Loop start step index", 0, lo=0, hi=len(steps) - 1)
         end_idx   = prompt_int("  Loop end step index", len(steps) - 1, lo=start_idx, hi=len(steps) - 1)
-        guard_v   = prompt_float("  Guard voltage — abort loop if crossed at ANY step inside it (V)",
-                                 max(2.50, limits["v_min"]), lo=limits["v_min"], hi=limits["v_max"])
-        loop = {"start_idx": start_idx, "end_idx": end_idx, "guard_voltage": guard_v}
-        print("  Note: firmware caps this at 50 iterations regardless of guard voltage.")
+        count     = prompt_int(f"  Number of passes through steps {start_idx}-{end_idx}",
+                               1, lo=1, hi=LOOP_MAX_PASSES)
+        guard_v   = prompt_loop_guard(steps, start_idx, end_idx, limits)
+        loop = {"start_idx": start_idx, "end_idx": end_idx,
+                "count": count, "guard_voltage": guard_v}
 
     protocol = {"name": name, "capacity_mah": capacity_mah, "steps": steps, "loop": loop}
 
@@ -404,7 +464,7 @@ def load_protocol():
         choice = input("  Select protocol number: ").strip()
         if choice.isdigit() and 0 <= int(choice) < len(files):
             with open(files[int(choice)]) as fh:
-                return json.load(fh)
+                return ensure_loop_count(json.load(fh))
         print("  Invalid choice, try again.")
 
 
@@ -419,7 +479,12 @@ def print_protocol_summary(protocol):
         print("  |  " + describe_step(i, s) + marker)
     if protocol.get("loop"):
         l = protocol["loop"]
-        print(f"  |  Loop: repeat steps {l['start_idx']}-{l['end_idx']} until Vmin={l['guard_voltage']}V (cap 50 iter)")
+        n = l.get("count", LOOP_LEGACY_PASSES)
+        guard = (f"guard stop at V <= {l['guard_voltage']:.3f} V" if l.get("guard_voltage", 0) > 0
+                 else "no guard")
+        after = (f", then steps {l['end_idx'] + 1}-{len(protocol['steps']) - 1}"
+                 if l["end_idx"] < len(protocol["steps"]) - 1 else "")
+        print(f"  |  Loop: steps {l['start_idx']}-{l['end_idx']} x {n} pass(es){after}; {guard}")
     print("  +" + "-" * 30)
 
 
@@ -450,6 +515,23 @@ def validate_protocol_limits(protocol, limits):
                 problems.append(f"step {i} {t}: discharge {I:.3f}A > {limits['i_discharge_max']:.2f}A cap")
             if v < limits["v_min"] - eps:
                 problems.append(f"step {i} {t}: Vmin {v:.3f}V < {limits['v_min']:.2f}V floor")
+    if len(protocol["steps"]) > FW_MAX_STEPS:
+        problems.append(f"{len(protocol['steps'])} steps > firmware limit of {FW_MAX_STEPS}")
+    loop = protocol.get("loop")
+    if loop:
+        n = len(protocol["steps"])
+        a, b = loop.get("start_idx", -1), loop.get("end_idx", -1)
+        if not (0 <= a <= b < n):
+            problems.append(f"loop range {a}-{b} is outside steps 0-{n - 1}")
+        else:
+            cnt = loop.get("count", LOOP_LEGACY_PASSES)
+            if not isinstance(cnt, int) or not 1 <= cnt <= LOOP_MAX_PASSES:
+                problems.append(f"loop count {cnt!r} must be an integer 1-{LOOP_MAX_PASSES}")
+            g = loop.get("guard_voltage", 0.0)
+            lowest = _loop_lowest_cutoff(protocol["steps"], a, b)
+            if g > 0 and lowest is not None and g >= lowest:
+                problems.append(f"loop guard {g:.3f}V >= lowest discharge cutoff {lowest:.3f}V "
+                                "in the loop (would end the run at the first discharge)")
     return problems
 
 
@@ -467,12 +549,15 @@ def send_confirmed(ser, cmd_str, expected_substr, timeout=2.0):
         if raw.startswith("MSG,"):
             print(f"    [FW] {raw[4:]}")
             if expected_substr in raw:
-                return True
+                return raw            # truthy; callers can inspect the echo
     print(f"    [WARN] No confirmation for: {cmd_str.strip()!r}")
     return False
 
 
 def upload_protocol(ser, protocol):
+    """Upload and start. Returns False (nothing started, buffer cleared) if the
+    firmware can't honour the protocol — currently: a loop pass count on
+    firmware that predates it (it would silently run 50 passes instead)."""
     print("\n  Uploading protocol to firmware...")
     cap_A = protocol["capacity_mah"] / 1000.0
 
@@ -502,11 +587,20 @@ def upload_protocol(ser, protocol):
 
     if protocol.get("loop"):
         l = protocol["loop"]
-        cmd = f"L,{l['start_idx']},{l['end_idx']},{l['guard_voltage']:.3f}\n"
-        send_confirmed(ser, cmd, "Loop set")
+        cnt = int(l.get("count", LOOP_LEGACY_PASSES))
+        cmd = f"L,{l['start_idx']},{l['end_idx']},{l.get('guard_voltage', 0.0):.3f},{cnt}\n"
+        echo = send_confirmed(ser, cmd, "Loop set")
+        if not echo or "count=" not in echo:
+            print("\n  [ABORT] The firmware did not confirm the loop pass count")
+            print("  (it predates the count and would run 50 passes regardless).")
+            print("  Flash the updated firmware, then retry. Nothing was started.")
+            time.sleep(1.2)              # let old firmware's leftover parse settle
+            send_confirmed(ser, "C\n", "cleared")
+            return False
 
     print("\n  Starting sequence...")
     send_confirmed(ser, "G\n", "Starting sequence", timeout=3.0)
+    return True
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -754,7 +848,7 @@ def serial_reader(ser, data: RunData, csv_writer, csv_file, stop_event: threadin
 # CSV logger
 # ─────────────────────────────────────────────────────────────────────────────
 
-def open_csv(protocol):
+def open_csv(protocol, fw_version=None):
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     fn = f"run_{protocol['name']}_{ts}.csv"
     fh = open(fn, "w", newline="")
@@ -762,7 +856,8 @@ def open_csv(protocol):
     wr.writerow(["# Battery Cycler sequence run — " + ts])
     wr.writerow(["# protocol=" + protocol["name"],
                  "capacity_mah=" + str(protocol["capacity_mah"]),
-                 "num_steps=" + str(len(protocol["steps"]))])
+                 "num_steps=" + str(len(protocol["steps"])),
+                 "fw_version=" + str(fw_version or "unknown")])
     wr.writerow(["elapsed_s", "state", "v_batt", "i_charge", "i_discharge",
                  "temp_nmos_c", "temp_batt_c", "step_idx", "loop_iter"])
     fh.flush()
@@ -984,7 +1079,8 @@ def main():
     ser.reset_input_buffer()
 
     # Fetch the board's safety envelope so the builder can bound inputs to it.
-    limits = fetch_limits(ser)
+    info = fetch_board_info(ser)
+    limits = info["limits"]
 
     print("\n  Streaming live readings for ~8s to verify sensors.")
     live_monitor(ser, duration=8.0)
@@ -1021,9 +1117,11 @@ def main():
         sys.exit(0)
 
     ser.reset_input_buffer()
-    upload_protocol(ser, protocol)
+    if not upload_protocol(ser, protocol):
+        ser.close()
+        sys.exit(1)
 
-    csv_fh, csv_wr = open_csv(protocol)
+    csv_fh, csv_wr = open_csv(protocol, info["fw_version"])
 
     data = RunData()
     stop_event = threading.Event()
