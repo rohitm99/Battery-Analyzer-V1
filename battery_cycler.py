@@ -763,6 +763,18 @@ def serial_reader(ser, data: RunData, csv_writer, csv_file, stop_event: threadin
         if line.startswith("MSG,"):
             msg = line[4:]
             print(f"\r  [FW] {msg}                    ")
+            # Keep every firmware message in the run CSV as a comment row, at
+            # the elapsed time of the last DATA sample, so a fault's reason
+            # (and what preceded it, e.g. a [CCCAL] trim) survives the session.
+            # Written raw: csv.writer would quote text containing commas, and
+            # a leading '"#' breaks pandas.read_csv(comment="#").
+            try:
+                with data.lock:
+                    el = data.t[-1] if data.t else 0.0
+                csv_file.write(f"# MSG t={el:.3f} {msg.replace(chr(10), ' ')}\n")
+                csv_file.flush()
+            except Exception:
+                pass
             if "FAULT" in msg.upper():
                 _finalize_eis()          # flush any partial EIS sweep before stopping
                 with data.lock:
